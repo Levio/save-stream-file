@@ -37,14 +37,21 @@ python3 main.py \
   --probe-read-attempts 2 \
   --probe-timeout-seconds 4 \
   --max-probe-profiles 30 \
-  --reconnect-warmup-seconds 2
+  --reconnect-warmup-seconds 2 \
+  --auto-upgrade-interval-seconds 8 \
+  --auto-upgrade-timeout-seconds 1.5 \
+  --max-upgrade-profiles 8 \
+  --restart-after-disconnect-seconds 30 \
+  --reconnect-expand-scan-every 6
 ```
 
 说明：
 - `--camera-index -1` 表示自动扫描 USB 相机；如果知道索引，可指定如 `--camera-index 0`。
 - 启动连接时会探测多组分辨率/帧率/像素格式，自动选择实际分辨率最高的可用流再开始保存。
 - 为避免启动卡住，探测阶段有总超时（`--probe-timeout-seconds`）和最大探测数（`--max-probe-profiles`）保护。
-- 断开后会优先用“上次成功的流配置”快速重连；失败时走轻量重连（目标配置 + 当前流），避免热插拔后长时间卡在探测。
+- 断开后重连会优先走“保活模式”（先读默认流，尽快恢复保存），再尝试上次配置和轻量目标配置，避免热插拔后因高清探测导致无法恢复。
+- 重连成功后若当前分辨率低于历史最佳分辨率，会在后台自动尝试切回高清（不阻塞当前录制）。
+- 如果热插拔后长时间仍无法重连，程序会自动重启进程尝试恢复（`--restart-after-disconnect-seconds`）。
 - 日志会打印“请求参数”和“实际参数”，例如：`请求=1920x1080@30 MJPG, 实际=3840x2160@15.00 MJPG`。
 - 程序会在连接后估算真实采集 fps，并用于写文件，避免出现“15 秒切片但播放仅几秒”的时长偏差。
 - 如果读取失败达到阈值，程序会判断相机断开并自动等待重连。
