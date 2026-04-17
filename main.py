@@ -69,6 +69,8 @@ class Recorder:
         self.frame_count = 0
         self.segment_serial = 0
         self.current_frame_size: tuple[int, int] | None = None
+        self._last_frame_hash: int | None = None
+        self._frozen_count = 0
         self.current_fps = self.cfg.target_fps
         self.last_good_index: int | None = None
         self.last_good_profile: StreamProfile | None = None
@@ -269,8 +271,12 @@ class Recorder:
         self, cap: cv2.VideoCapture, attempts: int, delay_seconds: float = 0.03
     ) -> tuple[bool, object | None]:
         for _ in range(attempts):
-            ok, frame = cap.read()
-            if ok and frame is not None:
+            try:
+                ok, frame = cap.read()
+            except cv2.error:
+                time.sleep(delay_seconds)
+                continue
+            if ok and frame is not None and frame.size > 0 and frame.shape[0] > 0 and frame.shape[1] > 0:
                 return True, frame
             time.sleep(delay_seconds)
         return False, None
@@ -279,6 +285,8 @@ class Recorder:
         backends: list[int | None] = []
         if sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
             backends.append(cv2.CAP_AVFOUNDATION)
+        elif sys.platform == "win32" and hasattr(cv2, "CAP_DSHOW"):
+            backends.append(cv2.CAP_DSHOW)
         backends.append(None)
 
         for backend in backends:
@@ -410,7 +418,7 @@ class Recorder:
         actual_fps = self.normalize_fps(cap.get(cv2.CAP_PROP_FPS), fps)
         actual_fourcc = self.fourcc_to_str(cap.get(cv2.CAP_PROP_FOURCC))
 
-        if actual_w < 320 or actual_h < 240:
+        if actual_w < max(320, width // 2) or actual_h < max(240, height // 2):
             return None
 
         return StreamProfile(
@@ -504,7 +512,10 @@ class Recorder:
         begin = time.monotonic()
         stamps: list[float] = []
         while len(stamps) < max_frames and (time.monotonic() - begin) < max_seconds:
-            ok, frame = cap.read()
+            try:
+                ok, frame = cap.read()
+            except cv2.error:
+                continue
             if not ok or frame is None:
                 continue
             stamps.append(time.monotonic())
@@ -639,7 +650,10 @@ class Recorder:
 
     def process_one_frame(self) -> bool:
         assert self.cap is not None
-        ok, frame = self.cap.read()
+        try:
+            ok, frame = self.cap.read()
+        except cv2.error:
+            ok, frame = False, None
         if not ok or frame is None:
             self.read_failures += 1
             if self.read_failures >= self.cfg.max_read_failures:
@@ -650,6 +664,16 @@ class Recorder:
         self.read_failures = 0
         now_mono = time.monotonic()
         now_wall = time.time()
+
+        # Detect frozen frames (DirectShow keeps returning same frame on disconnect)
+        frame_hash = hash(frame.tobytes()[::64])
+        if frame_hash == self._last_frame_hash:
+            self._frozen_count += 1
+            if self._frozen_count >= self.cfg.max_read_failures:
+                return False
+        else:
+            self._frozen_count = 0
+        self._last_frame_hash = frame_hash
 
         frame_h, frame_w = frame.shape[:2]
         frame_size = (frame_w, frame_h)
@@ -680,23 +704,24 @@ class Recorder:
             )
         return True
 
-    def build_segment_path(self, start_wall_ts: float, serial: int) -> Path:
+    def build_segment_path(self, start_wall_ts: float, serial: int, codec: str = "avc1") -> Path:
         dt = datetime.fromtimestamp(start_wall_ts)
         stamp = dt.strftime("%Y%m%d_%H%M%S")
         idx = self.cap_index if self.cap_index is not None else -1
-        name = f"{stamp}_cam{idx}_{serial:06d}.mp4"
+        ext = "avi" if codec == "MJPG" else "mp4"
+        name = f"{stamp}_cam{idx}_{serial:06d}.{ext}"
         return self.cfg.output_dir / name
 
     def open_new_segment(
         self, frame_size: tuple[int, int], now_mono: float, now_wall: float
     ) -> bool:
         self.segment_serial += 1
-        out_path = self.build_segment_path(now_wall, self.segment_serial)
         fps = self.normalize_fps(self.current_fps, self.cfg.target_fps)
 
         writer = None
         codec_used = None
         for codec in self.cfg.codec_candidates:
+            out_path = self.build_segment_path(now_wall, self.segment_serial, codec)
             fourcc = cv2.VideoWriter_fourcc(*codec)
             candidate = cv2.VideoWriter(str(out_path), fourcc, fps, frame_size)
             if candidate.isOpened():
@@ -731,6 +756,8 @@ class Recorder:
         self.cap_index = None
         self.active_profile = None
         self.read_failures = 0
+        self._frozen_count = 0
+        self._last_frame_hash = None
         if self.disconnected_since_monotonic is None:
             self.disconnected_since_monotonic = time.monotonic()
         self.restart_attempted_after_disconnect = False
@@ -840,14 +867,17 @@ def parse_args(argv: list[str]) -> Config:
     )
     args = parser.parse_args(argv)
 
+    min_w, min_h = max(320, args.width), max(240, args.height)
     resolution_pool = {
-        (3840, 2160),
-        (2560, 1440),
-        (1920, 1080),
-        (1600, 1200),
-        (1280, 720),
-        (640, 480),
-        (max(320, args.width), max(240, args.height)),
+        (w, h)
+        for w, h in [
+            (3840, 2160),
+            (2560, 1440),
+            (1920, 1080),
+            (1600, 1200),
+            (min_w, min_h),
+        ]
+        if w * h >= min_w * min_h
     }
     sorted_resolutions = tuple(
         sorted(resolution_pool, key=lambda size: (size[0] * size[1], size[0]), reverse=True)
@@ -869,7 +899,7 @@ def parse_args(argv: list[str]) -> Config:
         scan_max_index=max(0, args.scan_max_index),
         reconnect_interval=max(0.2, args.reconnect_interval),
         max_read_failures=max(1, args.max_read_failures),
-        codec_candidates=("avc1", "mp4v", "MJPG"),
+        codec_candidates=("MJPG", "avc1", "mp4v"),
         capture_fourcc_candidates=("MJPG", "YUYV", ""),
         probe_resolutions=sorted_resolutions,
         probe_fps_candidates=tuple(ordered_fps),
